@@ -1,0 +1,52 @@
+name: Publish clean X3 BLE source branch
+
+on:
+  push:
+    branches: [develop]
+    paths:
+      - '.github/workflows/publish-x3-ble-clean-branch.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upstream BLE feature branch
+        uses: actions/checkout@v6
+        with:
+          repository: crosspoint-reader/crosspoint-reader
+          ref: 869b01e909c622989988db595b7ac8672cbfb100
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download tested patched source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/x3patch
+          gh run download 34911210472 \
+            -R Sliff2000/crosspoint-reader \
+            -n x3-ble-source-patch \
+            -D /tmp/x3patch
+          cp /tmp/x3patch/src/activities/reader/EpubReaderActivity.cpp src/activities/reader/EpubReaderActivity.cpp
+          cp /tmp/x3patch/src/activities/reader/EpubReaderActivity.h src/activities/reader/EpubReaderActivity.h
+          cp /tmp/x3patch/platformio.ini platformio.ini
+
+      - name: Commit one clean source change and push branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "Sliff2000"
+          git config user.email "cjbriere@c-itsolutions.com"
+          git checkout -B fix/x3-ble-stability
+          git add src/activities/reader/EpubReaderActivity.cpp \
+                  src/activities/reader/EpubReaderActivity.h \
+                  platformio.ini
+          git commit -m "fix: stabilize X3 BLE reading under memory pressure"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/Sliff2000/crosspoint-reader.git"
+          git push --force origin fix/x3-ble-stability
