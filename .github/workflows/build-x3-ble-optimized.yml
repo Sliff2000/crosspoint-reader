@@ -51,13 +51,16 @@ jobs:
           sed -i 's/CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=50/CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=20/' platformio.ini
           sed -i 's/CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=10/CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=6/' platformio.ini
 
-      - name: Patch active-build and render OOM paths
+      - name: Patch BLE reader memory recovery
         run: |
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
+
           p = Path('src/activities/reader/EpubReaderActivity.cpp')
           s = p.read_text()
+
+          # Lend framebuffer before loading a page while an incremental build is resident.
           needle = '    auto p = section->loadPage(section->currentPage);\n'
           insert = (
               '    // Lend framebuffer before active-build page deserialization.\n'
@@ -70,6 +73,8 @@ jobs:
           if s.count(needle) != 1:
               raise SystemExit(f'expected exactly one page-load target, found {s.count(needle)}')
           s = s.replace(needle, insert + needle, 1)
+
+          # Before dropping BLE, release the much larger transient parser/CSS build state.
           old = (
               '  const auto restoreFramebufferForDraw = [&buildLoan]() {\n'
               '    if (!buildLoan.restore()) {\n'
@@ -80,15 +85,24 @@ jobs:
               '  };\n'
           )
           new = (
-              '  const auto restoreFramebufferForDraw = [&buildLoan]() {\n'
+              '  const auto restoreFramebufferForDraw = [this, &buildLoan]() {\n'
               '    if (!buildLoan.restore()) {\n'
               '      ESP.restart();\n'
               '      return false;\n'
               '    }\n'
-              '    // A successful framebuffer restore can still leave the general heap too fragmented for rendering.\n'
-              '    if (BleHid.isRunning() &&\n'
-              '        (ESP.getFreeHeap() < RENDER_MIN_FREE_HEAP || ESP.getMaxAllocHeap() < BACKGROUND_BUILD_MIN_MAX_ALLOC)) {\n'
-              '      LOG_INF("ERS", "Render heap low after framebuffer restore; freeing BLE (heap=%u maxAlloc=%u)",\n'
+              '    const auto heapLow = []() {\n'
+              '      return ESP.getFreeHeap() < RENDER_MIN_FREE_HEAP ||\n'
+              '             ESP.getMaxAllocHeap() < BACKGROUND_BUILD_MIN_MAX_ALLOC;\n'
+              '    };\n'
+              '    if (heapLow() && section && section->isBuilding()) {\n'
+              '      LOG_INF("ERS", "Render heap low; suspending section build before BLE shed (heap=%u maxAlloc=%u)",\n'
+              '              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());\n'
+              '      section->suspendBuild();\n'
+              '      LOG_INF("ERS", "Section build suspended heap=%u maxAlloc=%u",\n'
+              '              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());\n'
+              '    }\n'
+              '    if (heapLow() && BleHid.isRunning()) {\n'
+              '      LOG_INF("ERS", "Render heap still low; freeing BLE (heap=%u maxAlloc=%u)",\n'
               '              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());\n'
               '      bleinput::stop();\n'
               '    }\n'
@@ -97,22 +111,79 @@ jobs:
           )
           if old not in s:
               raise SystemExit('restoreFramebufferForDraw patch target not found')
-          p.write_text(s.replace(old, new, 1))
+          s = s.replace(old, new, 1)
+
+          # With BLE connected, wait until only two cached pages remain before extending a partial.
+          old = (
+              '  if (section && !section->isBuilding() && section->isPartial() && !RenderLock::peek() && buildViewportWidth > 0 &&\n'
+              '      !partialRebuildStartFailed &&\n'
+              '      section->currentPage + PARTIAL_REBUILD_START_MARGIN >= static_cast<int>(section->pageCount)) {\n'
+          )
+          new = (
+              '  const int partialResumeMargin = BleHid.isRunning() ? 2 : PARTIAL_REBUILD_START_MARGIN;\n'
+              '  if (section && !section->isBuilding() && section->isPartial() && !RenderLock::peek() && buildViewportWidth > 0 &&\n'
+              '      !partialRebuildStartFailed &&\n'
+              '      section->currentPage + partialResumeMargin >= static_cast<int>(section->pageCount)) {\n'
+          )
+          if old not in s:
+              raise SystemExit('partial resume condition target not found')
+          s = s.replace(old, new, 1)
+
+          # If we really need more pages, release BLE first, build a useful window,
+          # persist it as a partial, then let the normal lifecycle reconnect BLE.
+          old = (
+              '    RenderLock lock;\n'
+              '    const ReaderRenderSpec buildSpec = SETTINGS.readerRenderSpec(buildViewportWidth, buildViewportHeight);\n'
+              '    if (!section->startBuild(buildSpec)) {\n'
+              '      partialRebuildStartFailed = true;\n'
+              '      LOG_ERR("ERS", "Failed to start deferred partial extension build");\n'
+              '    } else {\n'
+              '      LOG_DBG("ERS", "Reader near partial watermark (%d/%d), resuming extension build", section->currentPage,\n'
+              '              section->pageCount);\n'
+              '    }\n'
+              '  }\n'
+          )
+          new = (
+              '    RenderLock lock;\n'
+              '    if (BleHid.isRunning()) {\n'
+              '      LOG_INF("ERS", "Partial watermark near; temporarily freeing BLE for extension build");\n'
+              '      bleinput::stop();\n'
+              '    }\n'
+              '    const ReaderRenderSpec buildSpec = SETTINGS.readerRenderSpec(buildViewportWidth, buildViewportHeight);\n'
+              '    if (!section->startBuild(buildSpec)) {\n'
+              '      partialRebuildStartFailed = true;\n'
+              '      LOG_ERR("ERS", "Failed to start deferred partial extension build");\n'
+              '    } else {\n'
+              '      LOG_DBG("ERS", "Reader near partial watermark (%d/%d), extending read-ahead window", section->currentPage,\n'
+              '              section->pageCount);\n'
+              '      FrameBufferBuildLoan buildLoan(renderer);\n'
+              '      buildLoan.release();\n'
+              '      if (!section->buildSomeMore(16)) {\n'
+              '        LOG_ERR("ERS", "Deferred partial extension build failed");\n'
+              '        section.reset();\n'
+              '        requestUpdate();\n'
+              '      } else if (section->isBuilding()) {\n'
+              '        section->suspendBuild();\n'
+              '        LOG_INF("ERS", "Read-ahead window persisted; BLE may reconnect (heap=%u maxAlloc=%u)",\n'
+              '                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());\n'
+              '      }\n'
+              '      if (!buildLoan.restore()) {\n'
+              '        ESP.restart();\n'
+              '      }\n'
+              '    }\n'
+              '  }\n'
+          )
+          if old not in s:
+              raise SystemExit('partial extension block target not found')
+          s = s.replace(old, new, 1)
+
+          p.write_text(s)
           PY
 
       - name: Build release firmware
         run: |
           set -euo pipefail
           pio run -e gh_release | tee pio.log
-
-      - name: Symbolize latest X3 crash
-        run: |
-          set -euo pipefail
-          ADDR2LINE="$(find ~/.platformio/packages -type f -name 'riscv32-esp-elf-addr2line' | head -1)"
-          "$ADDR2LINE" -pfiaC -e .pio/build/gh_release/firmware.elf \
-            0x421eda9b 0x421eda9e 0x421edaea 0x421edc0c 0x421f0aa2 0x421edd56 \
-            0x420511dc 0x42054e0a 0x4209f1c4 0x42094a58 0x420ea558 0x4204702c \
-            0x42051af0 0x420e8a40 0x421386b0 0x420edfda 0x420dddca | tee symbolized-crash.txt
 
       - name: Upload X3 BLE firmware and symbols
         uses: actions/upload-artifact@v6
@@ -122,5 +193,4 @@ jobs:
             .pio/build/gh_release/firmware.bin
             .pio/build/gh_release/firmware.elf
             .pio/build/gh_release/firmware.map
-            symbolized-crash.txt
           if-no-files-found: error
