@@ -51,20 +51,40 @@ jobs:
           sed -i 's/CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=50/CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=20/' platformio.ini
           sed -i 's/CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=10/CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=6/' platformio.ini
 
-      - name: Patch BLE reader memory recovery
+      - name: Patch X3 BLE reader memory safeguards
         run: |
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
 
+          h = Path('src/activities/reader/EpubReaderActivity.h')
+          hs = h.read_text()
+          replacements = {
+              '  static constexpr int BUILD_PAGES_PER_CHUNK = 8;': '  static constexpr int BUILD_PAGES_PER_CHUNK = 4;',
+              '  static constexpr int BACKGROUND_BUILD_PAGES_PER_TICK = 2;': '  static constexpr int BACKGROUND_BUILD_PAGES_PER_TICK = 1;',
+              '  static constexpr size_t BACKGROUND_BUILD_MIN_FREE_HEAP = 26 * 1024;': '  static constexpr size_t BACKGROUND_BUILD_MIN_FREE_HEAP = 34 * 1024;',
+              '  static constexpr size_t BACKGROUND_BUILD_MIN_MAX_ALLOC = 13 * 1024;': '  static constexpr size_t BACKGROUND_BUILD_MIN_MAX_ALLOC = 20 * 1024;',
+              '  static constexpr size_t RENDER_MIN_FREE_HEAP = 24 * 1024;': '  static constexpr size_t RENDER_MIN_FREE_HEAP = 30 * 1024;',
+              '  static constexpr int BUILD_WINDOW_AHEAD = 5;': '  static constexpr int BUILD_WINDOW_AHEAD = 4;',
+          }
+          for old, new in replacements.items():
+              if old not in hs:
+                  raise SystemExit(f'header patch target missing: {old}')
+              hs = hs.replace(old, new, 1)
+          h.write_text(hs)
+
           p = Path('src/activities/reader/EpubReaderActivity.cpp')
           s = p.read_text()
 
-          # Lend the framebuffer before loading a page while a section build is
-          # active. This preserves the previous X3 BLE heap-safety fix.
+          # Before deserializing a page, stop background parsing and lend the
+          # framebuffer when heap/maxAlloc is tight. BLE stays connected.
           needle = '    auto p = section->loadPage(section->currentPage);\n'
           insert = (
               '    if (section->isBuilding()) {\n'
+              '      section->suspendBuild();\n'
+              '    }\n'
+              '    if (ESP.getFreeHeap() < RENDER_MIN_FREE_HEAP ||\n'
+              '        ESP.getMaxAllocHeap() < BACKGROUND_BUILD_MIN_MAX_ALLOC) {\n'
               '      buildLoan.release();\n'
               '    }\n'
           )
@@ -72,8 +92,8 @@ jobs:
               raise SystemExit(f'page load target mismatch: {s.count(needle)}')
           s = s.replace(needle, insert + needle, 1)
 
-          # If restoring the framebuffer is tight on heap, pause background
-          # parsing first and only shed BLE as a last resort.
+          # Restoring the framebuffer may still shed BLE internally if allocation
+          # actually fails, but low heap alone no longer disconnects BLE.
           old = (
               '  const auto restoreFramebufferForDraw = [&buildLoan]() {\n'
               '    if (!buildLoan.restore()) {\n'
@@ -89,15 +109,10 @@ jobs:
               '      ESP.restart();\n'
               '      return false;\n'
               '    }\n'
-              '    const auto heapLow = []() {\n'
-              '      return ESP.getFreeHeap() < RENDER_MIN_FREE_HEAP ||\n'
-              '             ESP.getMaxAllocHeap() < BACKGROUND_BUILD_MIN_MAX_ALLOC;\n'
-              '    };\n'
-              '    if (heapLow() && section && section->isBuilding()) {\n'
+              '    if ((ESP.getFreeHeap() < RENDER_MIN_FREE_HEAP ||\n'
+              '         ESP.getMaxAllocHeap() < BACKGROUND_BUILD_MIN_MAX_ALLOC) &&\n'
+              '        section && section->isBuilding()) {\n'
               '      section->suspendBuild();\n'
-              '    }\n'
-              '    if (heapLow() && BleHid.isRunning()) {\n'
-              '      bleinput::stop();\n'
               '    }\n'
               '    return true;\n'
               '  };\n'
@@ -106,10 +121,7 @@ jobs:
               raise SystemExit('restore target mismatch')
           s = s.replace(old, new, 1)
 
-          # Begin extending the partial cache a little earlier with BLE active,
-          # but leave the actual extension to the normal incremental background
-          # builder. The previous firmware synchronously built 16 pages here;
-          # that is the boundary users saw as a blank screen / apparent jump.
+          # With BLE active, maintain only a four-page read-ahead watermark.
           old = (
               '  if (section && !section->isBuilding() && section->isPartial() && !RenderLock::peek() && buildViewportWidth > 0 &&\n'
               '      !partialRebuildStartFailed &&\n'
@@ -123,6 +135,29 @@ jobs:
           )
           if old not in s:
               raise SystemExit('partial condition mismatch')
+          s = s.replace(old, new, 1)
+
+          # Background read-ahead is optional work. If the heap is fragmented,
+          # pause it instead of disconnecting BLE just to continue prebuilding.
+          old = (
+              '  if (BleHid.isRunning()) {\n'
+              '    LOG_INF("ERS", "Background build needs heap (free=%u maxAlloc=%u); freeing BLE RAM", (unsigned)freeHeap,\n'
+              '            (unsigned)maxBlock);\n'
+              '    bleinput::stop();\n'
+              '  }\n'
+              '  buildHeapPaused = true;\n'
+              '  return false;\n'
+          )
+          new = (
+              '  if (BleHid.isRunning()) {\n'
+              '    LOG_INF("ERS", "Background build paused for heap (free=%u maxAlloc=%u); keeping BLE connected",\n'
+              '            (unsigned)freeHeap, (unsigned)maxBlock);\n'
+              '  }\n'
+              '  buildHeapPaused = true;\n'
+              '  return false;\n'
+          )
+          if old not in s:
+              raise SystemExit('background heap gate target mismatch')
           s = s.replace(old, new, 1)
 
           p.write_text(s)
