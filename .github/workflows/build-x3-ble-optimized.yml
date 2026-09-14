@@ -56,18 +56,24 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
+
           p = Path('src/activities/reader/EpubReaderActivity.cpp')
           s = p.read_text()
 
+          # Lend the framebuffer before loading a page while a section build is
+          # active. This preserves the previous X3 BLE heap-safety fix.
           needle = '    auto p = section->loadPage(section->currentPage);\n'
           insert = (
               '    if (section->isBuilding()) {\n'
               '      buildLoan.release();\n'
               '    }\n'
           )
-          if s.count(needle) != 1: raise SystemExit('page load target mismatch')
+          if s.count(needle) != 1:
+              raise SystemExit(f'page load target mismatch: {s.count(needle)}')
           s = s.replace(needle, insert + needle, 1)
 
+          # If restoring the framebuffer is tight on heap, pause background
+          # parsing first and only shed BLE as a last resort.
           old = (
               '  const auto restoreFramebufferForDraw = [&buildLoan]() {\n'
               '    if (!buildLoan.restore()) {\n'
@@ -79,82 +85,46 @@ jobs:
           )
           new = (
               '  const auto restoreFramebufferForDraw = [this, &buildLoan]() {\n'
-              '    if (!buildLoan.restore()) { ESP.restart(); return false; }\n'
+              '    if (!buildLoan.restore()) {\n'
+              '      ESP.restart();\n'
+              '      return false;\n'
+              '    }\n'
               '    const auto heapLow = []() {\n'
               '      return ESP.getFreeHeap() < RENDER_MIN_FREE_HEAP ||\n'
               '             ESP.getMaxAllocHeap() < BACKGROUND_BUILD_MIN_MAX_ALLOC;\n'
               '    };\n'
-              '    if (heapLow() && section && section->isBuilding()) section->suspendBuild();\n'
-              '    if (heapLow() && BleHid.isRunning()) bleinput::stop();\n'
+              '    if (heapLow() && section && section->isBuilding()) {\n'
+              '      section->suspendBuild();\n'
+              '    }\n'
+              '    if (heapLow() && BleHid.isRunning()) {\n'
+              '      bleinput::stop();\n'
+              '    }\n'
               '    return true;\n'
               '  };\n'
           )
-          if old not in s: raise SystemExit('restore target mismatch')
+          if old not in s:
+              raise SystemExit('restore target mismatch')
           s = s.replace(old, new, 1)
 
+          # Begin extending the partial cache a little earlier with BLE active,
+          # but leave the actual extension to the normal incremental background
+          # builder. The previous firmware synchronously built 16 pages here;
+          # that is the boundary users saw as a blank screen / apparent jump.
           old = (
               '  if (section && !section->isBuilding() && section->isPartial() && !RenderLock::peek() && buildViewportWidth > 0 &&\n'
               '      !partialRebuildStartFailed &&\n'
               '      section->currentPage + PARTIAL_REBUILD_START_MARGIN >= static_cast<int>(section->pageCount)) {\n'
           )
           new = (
-              '  const int partialResumeMargin = BleHid.isRunning() ? 2 : PARTIAL_REBUILD_START_MARGIN;\n'
+              '  const int partialResumeMargin = BleHid.isRunning() ? 4 : PARTIAL_REBUILD_START_MARGIN;\n'
               '  if (section && !section->isBuilding() && section->isPartial() && !RenderLock::peek() && buildViewportWidth > 0 &&\n'
               '      !partialRebuildStartFailed &&\n'
               '      section->currentPage + partialResumeMargin >= static_cast<int>(section->pageCount)) {\n'
           )
-          if old not in s: raise SystemExit('partial condition mismatch')
+          if old not in s:
+              raise SystemExit('partial condition mismatch')
           s = s.replace(old, new, 1)
 
-          old = (
-              '    RenderLock lock;\n'
-              '    const ReaderRenderSpec buildSpec = SETTINGS.readerRenderSpec(buildViewportWidth, buildViewportHeight);\n'
-              '    if (!section->startBuild(buildSpec)) {\n'
-              '      partialRebuildStartFailed = true;\n'
-              '      LOG_ERR("ERS", "Failed to start deferred partial extension build");\n'
-              '    } else {\n'
-              '      LOG_DBG("ERS", "Reader near partial watermark (%d/%d), resuming extension build", section->currentPage,\n'
-              '              section->pageCount);\n'
-              '    }\n'
-              '  }\n'
-          )
-          new = (
-              '    RenderLock lock;\n'
-              '    if (BleHid.isRunning()) bleinput::stop();\n'
-              '    const ReaderRenderSpec buildSpec = SETTINGS.readerRenderSpec(buildViewportWidth, buildViewportHeight);\n'
-              '    if (!section->startBuild(buildSpec)) {\n'
-              '      partialRebuildStartFailed = true;\n'
-              '      LOG_ERR("ERS", "Failed to start final section-cache build");\n'
-              '    } else {\n'
-              '      // Once a partial watermark is reached, finish the section in one\n'
-              '      // uninterrupted build while BLE and framebuffer RAM are released.\n'
-              '      // buildSomeMore(0) is the Section API contract for build-to-completion;\n'
-              '      // this avoids repeatedly committing/reopening partial trailers/LUTs.\n'
-              '      FrameBufferBuildLoan buildLoan(renderer);\n'
-              '      buildLoan.release();\n'
-              '      if (!section->buildSomeMore(0)) {\n'
-              '        LOG_ERR("ERS", "Final section-cache build failed");\n'
-              '        section->abandonBuild();\n'
-              '        section.reset();\n'
-              '        requestUpdate();\n'
-              '      }\n'
-              '      if (!buildLoan.restore()) ESP.restart();\n'
-              '    }\n'
-              '  }\n'
-          )
-          if old not in s: raise SystemExit('partial extension target mismatch')
-          s = s.replace(old, new, 1)
-          p.write_text(s)
-
-          p = Path('src/main.cpp')
-          s = p.read_text()
-          redraw = (
-              '    if (activityManager.isReaderActivity() && !activityManager.currentKeepsBluetoothAlive()) {\n'
-              '      activityManager.requestUpdate();\n'
-              '    }\n'
-          )
-          if s.count(redraw) != 2: raise SystemExit('BLE redraw hook mismatch')
-          s = s.replace(redraw, '', 2)
           p.write_text(s)
           PY
 
