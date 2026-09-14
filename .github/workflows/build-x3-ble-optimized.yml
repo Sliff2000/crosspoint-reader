@@ -160,6 +160,25 @@ jobs:
               raise SystemExit('background heap gate target mismatch')
           s = s.replace(old, new, 1)
 
+          # Never draw the indexing popup while BLE reading. At the partial-cache
+          # boundary, silently extend the cache with the framebuffer loaned instead.
+          old = (
+              '  if (section->isPartial() && section->currentPage >= static_cast<int>(section->pageCount)) {\n'
+              '    GUI.drawPopup(renderer, tr(STR_INDEXING));\n'
+              '    pagesUntilFullRefresh = 1;\n'
+              '  }\n'
+          )
+          new = (
+              '  if (section->isPartial() && section->currentPage >= static_cast<int>(section->pageCount) &&\n'
+              '      !BleHid.isRunning() && renderer.hasFrameBuffer()) {\n'
+              '    GUI.drawPopup(renderer, tr(STR_INDEXING));\n'
+              '    pagesUntilFullRefresh = 1;\n'
+              '  }\n'
+          )
+          if old not in s:
+              raise SystemExit('indexing popup target mismatch')
+          s = s.replace(old, new, 1)
+
           p.write_text(s)
           PY
 
