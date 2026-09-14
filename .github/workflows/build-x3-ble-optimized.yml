@@ -61,9 +61,22 @@ jobs:
       - name: Build release firmware
         run: pio run -e gh_release | tee pio.log
 
-      - name: Upload X3 BLE firmware
+      - name: Symbolize latest X3 crash
+        run: |
+          set -euo pipefail
+          ADDR2LINE="$(find ~/.platformio/packages -type f -name 'riscv32-esp-elf-addr2line' | head -1)"
+          "$ADDR2LINE" -pfiaC -e .pio/build/gh_release/firmware.elf \
+            0x421eda47 0x421eda4a 0x421eda96 0x421ed08a 0x421edce4 0x421edd0e \
+            0x4209f73a 0x42095266 0x4204723a 0x42095524 0x4209b506 0x42051aca \
+            0x4209c0a4 0x420ede2e 0x420cd370 | tee symbolized-crash.txt
+
+      - name: Upload X3 BLE firmware and symbols
         uses: actions/upload-artifact@v6
         with:
           name: x3-ble-optimized-firmware
-          path: .pio/build/gh_release/firmware.bin
+          path: |
+            .pio/build/gh_release/firmware.bin
+            .pio/build/gh_release/firmware.elf
+            .pio/build/gh_release/firmware.map
+            symbolized-crash.txt
           if-no-files-found: error
