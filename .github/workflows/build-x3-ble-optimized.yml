@@ -56,21 +56,16 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
-
           p = Path('src/activities/reader/EpubReaderActivity.cpp')
           s = p.read_text()
 
           needle = '    auto p = section->loadPage(section->currentPage);\n'
           insert = (
-              '    // Lend framebuffer before active-build page deserialization.\n'
               '    if (section->isBuilding()) {\n'
-              '      LOG_INF("ERS", "Active build page load: lending framebuffer (ble=%u heap=%u maxAlloc=%u)",\n'
-              '              BleHid.isRunning() ? 1 : 0, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());\n'
               '      buildLoan.release();\n'
               '    }\n'
           )
-          if s.count(needle) != 1:
-              raise SystemExit(f'expected exactly one page-load target, found {s.count(needle)}')
+          if s.count(needle) != 1: raise SystemExit('page load target mismatch')
           s = s.replace(needle, insert + needle, 1)
 
           old = (
@@ -84,29 +79,17 @@ jobs:
           )
           new = (
               '  const auto restoreFramebufferForDraw = [this, &buildLoan]() {\n'
-              '    if (!buildLoan.restore()) {\n'
-              '      ESP.restart();\n'
-              '      return false;\n'
-              '    }\n'
+              '    if (!buildLoan.restore()) { ESP.restart(); return false; }\n'
               '    const auto heapLow = []() {\n'
               '      return ESP.getFreeHeap() < RENDER_MIN_FREE_HEAP ||\n'
               '             ESP.getMaxAllocHeap() < BACKGROUND_BUILD_MIN_MAX_ALLOC;\n'
               '    };\n'
-              '    if (heapLow() && section && section->isBuilding()) {\n'
-              '      LOG_INF("ERS", "Render heap low; suspending section build before BLE shed (heap=%u maxAlloc=%u)",\n'
-              '              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());\n'
-              '      section->suspendBuild();\n'
-              '    }\n'
-              '    if (heapLow() && BleHid.isRunning()) {\n'
-              '      LOG_INF("ERS", "Render heap still low; freeing BLE (heap=%u maxAlloc=%u)",\n'
-              '              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());\n'
-              '      bleinput::stop();\n'
-              '    }\n'
+              '    if (heapLow() && section && section->isBuilding()) section->suspendBuild();\n'
+              '    if (heapLow() && BleHid.isRunning()) bleinput::stop();\n'
               '    return true;\n'
               '  };\n'
           )
-          if old not in s:
-              raise SystemExit('restoreFramebufferForDraw patch target not found')
+          if old not in s: raise SystemExit('restore target mismatch')
           s = s.replace(old, new, 1)
 
           old = (
@@ -120,8 +103,7 @@ jobs:
               '      !partialRebuildStartFailed &&\n'
               '      section->currentPage + partialResumeMargin >= static_cast<int>(section->pageCount)) {\n'
           )
-          if old not in s:
-              raise SystemExit('partial resume condition target not found')
+          if old not in s: raise SystemExit('partial condition mismatch')
           s = s.replace(old, new, 1)
 
           old = (
@@ -138,54 +120,32 @@ jobs:
           )
           new = (
               '    RenderLock lock;\n'
-              '    if (BleHid.isRunning()) {\n'
-              '      LOG_INF("ERS", "Partial watermark near; temporarily freeing BLE for extension build");\n'
-              '      bleinput::stop();\n'
-              '    }\n'
+              '    if (BleHid.isRunning()) bleinput::stop();\n'
               '    const ReaderRenderSpec buildSpec = SETTINGS.readerRenderSpec(buildViewportWidth, buildViewportHeight);\n'
               '    if (!section->startBuild(buildSpec)) {\n'
               '      partialRebuildStartFailed = true;\n'
-              '      LOG_ERR("ERS", "Failed to start deferred partial extension build");\n'
+              '      LOG_ERR("ERS", "Failed to start final section-cache build");\n'
               '    } else {\n'
-              '      // Build a short disk-backed read-ahead window. The physical e-ink panel\n'
-              '      // retains the current page while RAM framebuffer storage is loaned.\n'
-              '      // After restoring RAM, explicitly re-render the same logical page into\n'
-              '      // the framebuffer WITHOUT requesting a panel update. This keeps RAM and\n'
-              '      // panel state synchronized, preventing the next normal page turn from\n'
-              '      // clearing the panel or producing a blank frame.\n'
+              '      // Once a partial watermark is reached, finish the section in one\n'
+              '      // uninterrupted build while BLE and framebuffer RAM are released.\n'
+              '      // buildSomeMore(0) is the Section API contract for build-to-completion;\n'
+              '      // this avoids repeatedly committing/reopening partial trailers/LUTs.\n'
               '      FrameBufferBuildLoan buildLoan(renderer);\n'
               '      buildLoan.release();\n'
-              '      if (!section->buildSomeMore(16)) {\n'
-              '        LOG_ERR("ERS", "Deferred partial extension build failed");\n'
+              '      if (!section->buildSomeMore(0)) {\n'
+              '        LOG_ERR("ERS", "Final section-cache build failed");\n'
+              '        section->abandonBuild();\n'
               '        section.reset();\n'
               '        requestUpdate();\n'
-              '      } else if (section->isBuilding()) {\n'
-              '        section->suspendBuild();\n'
               '      }\n'
-              '      if (!buildLoan.restore()) {\n'
-              '        ESP.restart();\n'
-              '      } else if (section) {\n'
-              '        // Repaint only the in-RAM framebuffer; do not touch the e-ink panel.\n'
-              '        // The normal page-turn event will perform the next physical refresh.\n'
-              '        auto current = section->loadPage(section->currentPage);\n'
-              '        if (current) {\n'
-              '          renderer.clearScreen();\n'
-              '          renderer.renderPage(*current);\n'
-              '          LOG_INF("ERS", "Read-ahead complete; current page restored in framebuffer");\n'
-              '        } else {\n'
-              '          LOG_ERR("ERS", "Could not restore current page framebuffer after read-ahead");\n'
-              '          requestUpdate();\n'
-              '        }\n'
-              '      }\n'
+              '      if (!buildLoan.restore()) ESP.restart();\n'
               '    }\n'
               '  }\n'
           )
-          if old not in s:
-              raise SystemExit('partial extension block target not found')
+          if old not in s: raise SystemExit('partial extension target mismatch')
           s = s.replace(old, new, 1)
           p.write_text(s)
 
-          # BLE transitions themselves must not trigger a reader panel repaint.
           p = Path('src/main.cpp')
           s = p.read_text()
           redraw = (
@@ -193,9 +153,7 @@ jobs:
               '      activityManager.requestUpdate();\n'
               '    }\n'
           )
-          count = s.count(redraw)
-          if count != 2:
-              raise SystemExit(f'expected two BLE reader redraw hooks, found {count}')
+          if s.count(redraw) != 2: raise SystemExit('BLE redraw hook mismatch')
           s = s.replace(redraw, '', 2)
           p.write_text(s)
           PY
