@@ -51,15 +51,39 @@ jobs:
           sed -i 's/CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=50/CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=20/' platformio.ini
           sed -i 's/CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=10/CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=6/' platformio.ini
 
-      - name: Cache PlatformIO packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.platformio
-          key: pio-x3-ble-opt-${{ hashFiles('platformio.ini') }}
-          restore-keys: pio-x3-ble-opt-
+      - name: Prime custom Arduino framework rebuild
+        run: |
+          set +e
+          pio run -e gh_release > bootstrap.log 2>&1
+          rc=$?
+          set -e
+          echo "bootstrap exit=$rc (a first-pass link failure is expected)"
+          tail -80 bootstrap.log
+
+      - name: Reapply BLE weak-symbol patch after framework rebuild
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          roots = list(Path.home().glob('.platformio/packages/framework-arduinoespressif32/cores/esp32/esp32-hal-bt-mem.h'))
+          if not roots:
+              raise SystemExit('esp32-hal-bt-mem.h not found')
+          p = roots[0]
+          s = p.read_text()
+          old = 'extern bool _btLibraryInUse;'
+          new = '__attribute__((weak)) bool _btLibraryInUse = false;  /* CrossPoint CI post-rebuild patch */'
+          if new not in s:
+              if old not in s:
+                  raise SystemExit('expected _btLibraryInUse declaration not found')
+              p.write_text(s.replace(old, new))
+          print(p)
+          print([line for line in p.read_text().splitlines() if '_btLibraryInUse' in line])
+          PY
 
       - name: Build release firmware
-        run: pio run -e gh_release | tee pio.log
+        run: |
+          set -euo pipefail
+          pio run -e gh_release | tee pio.log
 
       - name: Symbolize latest X3 crash
         run: |
