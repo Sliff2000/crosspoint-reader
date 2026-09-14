@@ -60,7 +60,6 @@ jobs:
           p = Path('src/activities/reader/EpubReaderActivity.cpp')
           s = p.read_text()
 
-          # Lend framebuffer before loading a page while an incremental build is resident.
           needle = '    auto p = section->loadPage(section->currentPage);\n'
           insert = (
               '    // Lend framebuffer before active-build page deserialization.\n'
@@ -74,7 +73,6 @@ jobs:
               raise SystemExit(f'expected exactly one page-load target, found {s.count(needle)}')
           s = s.replace(needle, insert + needle, 1)
 
-          # Before dropping BLE, release the much larger transient parser/CSS build state.
           old = (
               '  const auto restoreFramebufferForDraw = [&buildLoan]() {\n'
               '    if (!buildLoan.restore()) {\n'
@@ -113,7 +111,6 @@ jobs:
               raise SystemExit('restoreFramebufferForDraw patch target not found')
           s = s.replace(old, new, 1)
 
-          # With BLE connected, wait until only two cached pages remain before extending a partial.
           old = (
               '  if (section && !section->isBuilding() && section->isPartial() && !RenderLock::peek() && buildViewportWidth > 0 &&\n'
               '      !partialRebuildStartFailed &&\n'
@@ -129,8 +126,6 @@ jobs:
               raise SystemExit('partial resume condition target not found')
           s = s.replace(old, new, 1)
 
-          # If we really need more pages, release BLE first, build a useful window,
-          # persist it as a partial, then let the normal lifecycle reconnect BLE.
           old = (
               '    RenderLock lock;\n'
               '    const ReaderRenderSpec buildSpec = SETTINGS.readerRenderSpec(buildViewportWidth, buildViewportHeight);\n'
@@ -176,7 +171,21 @@ jobs:
           if old not in s:
               raise SystemExit('partial extension block target not found')
           s = s.replace(old, new, 1)
+          p.write_text(s)
 
+          # A BLE link transition does not change reader pixels. Redrawing the reader
+          # on reconnect was the visible flash every read-ahead cycle. Keep lifecycle
+          # logging/reconnect, but suppress the unnecessary reader repaint.
+          p = Path('src/main.cpp')
+          s = p.read_text()
+          old = '''    if (activityManager.isReaderActivity() && !activityManager.currentKeepsBluetoothAlive()) {
+      activityManager.requestUpdate();
+    }
+'''
+          count = s.count(old)
+          if count != 2:
+              raise SystemExit(f'expected two BLE reader redraw hooks, found {count}')
+          s = s.replace(old, '', 2)
           p.write_text(s)
           PY
 
