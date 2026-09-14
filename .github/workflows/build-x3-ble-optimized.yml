@@ -51,6 +51,40 @@ jobs:
           sed -i 's/CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=50/CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=20/' platformio.ini
           sed -i 's/CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=10/CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=6/' platformio.ini
 
+      - name: Patch active-build page-load OOM
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/activities/reader/EpubReaderActivity.cpp')
+          s = p.read_text()
+          old = '''  {
+            auto p = section->loadPage(section->currentPage);
+            if (!p) {
+          '''
+          new = '''  {
+            // While an incremental section build is still alive, its parser/CSS state
+            // keeps a large amount of heap resident. The old code could enter page
+            // deserialization with BLE + framebuffer + build state all resident and
+            // exhaust the C3 heap inside `new (std::nothrow) TextBlock()`. libstdc++
+            // still tries to construct std::bad_alloc there, which terminates when
+            // the heap is already exhausted. Lend the 48 KB framebuffer before any
+            // page load from an active build; restore() already sheds BLE if the
+            // framebuffer cannot be reclaimed afterwards.
+            if (section->isBuilding()) {
+              LOG_INF("ERS", "Active build page load: lending framebuffer (ble=%u heap=%u maxAlloc=%u)",
+                      BleHid.isRunning() ? 1 : 0, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+              buildLoan.release();
+            }
+            auto p = section->loadPage(section->currentPage);
+            if (!p) {
+          '''
+          if old not in s:
+              raise SystemExit('page-load patch target not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
       - name: Build release firmware
         run: |
           set -euo pipefail
