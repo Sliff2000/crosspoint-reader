@@ -1,0 +1,77 @@
+name: Build optimized X3 BLE firmware
+
+on:
+  push:
+    branches: [x3-ble-memory]
+    paths:
+      - '.github/workflows/build-x3-ble-optimized.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-x3-ble:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout BLE source
+        uses: actions/checkout@v6
+        with:
+          repository: crosspoint-reader/crosspoint-reader
+          ref: 869b01e909c622989988db595b7ac8672cbfb100
+          submodules: recursive
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: latest
+          enable-cache: false
+
+      - name: Install PlatformIO Core
+        run: |
+          uv pip install --system -U https://github.com/pioarduino/platformio-core/archive/refs/tags/v6.1.19.zip
+          uv pip install --system -U "littlefs-python>=0.16.0" "fatfs-ng>=0.1.14" "pyyaml>=6.0.2" \
+            "rich-click>=1.8.6" "zopfli>=0.2.2" "intelhex>=2.3.0" "rich>=14.0.0" "urllib3<2" \
+            "cryptography>=45.0.3" "certifi>=2025.8.3" "ecdsa>=0.19.1" "bitstring>=4.3.1" \
+            "reedsolo>=1.5.3,<1.8" "esp-idf-size>=2.0.0" "esp-coredump>=1.14.0"
+
+      - name: Apply X3 BLE memory tuning
+        run: |
+          set -euo pipefail
+          sed -i 's/CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=6/CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=4/' platformio.ini
+          sed -i 's/CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=6/CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=4/' platformio.ini
+          sed -i 's/CONFIG_BT_NIMBLE_ACL_BUF_COUNT=6/CONFIG_BT_NIMBLE_ACL_BUF_COUNT=4/' platformio.ini
+          sed -i 's/CONFIG_BT_NIMBLE_HCI_EVT_HI_BUF_COUNT=12/CONFIG_BT_NIMBLE_HCI_EVT_HI_BUF_COUNT=8/' platformio.ini
+          sed -i 's/CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=6/CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=4/' platformio.ini
+          sed -i 's/CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=12/CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=8/' platformio.ini
+          sed -i 's/CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=50/CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=20/' platformio.ini
+          sed -i 's/CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=10/CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=6/' platformio.ini
+          echo 'Applied conservative single-HID-host BLE pool reductions.'
+          grep -E 'NIMBLE_(MSYS|ACL|HCI|TRANSPORT)|ADV_REPORT_FLOW|ADV_DUP' platformio.ini || true
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-x3-ble-opt-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-x3-ble-opt-
+
+      - name: Build release firmware
+        run: |
+          set -euo pipefail
+          pio run -e gh_release | tee pio.log
+
+      - name: Show firmware stats
+        run: |
+          grep -E 'RAM:|Flash:' pio.log || true
+          ls -lh .pio/build/gh_release/firmware.bin
+
+      - name: Upload X3 BLE firmware
+        uses: actions/upload-artifact@v6
+        with:
+          name: x3-ble-optimized-firmware
+          path: .pio/build/gh_release/firmware.bin
+          if-no-files-found: error
