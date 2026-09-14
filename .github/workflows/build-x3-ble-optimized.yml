@@ -56,15 +56,11 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
-
           p = Path('src/activities/reader/EpubReaderActivity.cpp')
           s = p.read_text()
-
           needle = '    auto p = section->loadPage(section->currentPage);\n'
           insert = (
-              '    // An active incremental build keeps parser/CSS state resident. Lend the\n'
-              '    // framebuffer before page deserialization so BLE + build state cannot\n'
-              '    // exhaust the C3 heap inside TextBlock allocation.\n'
+              '    // Lend framebuffer before active-build page deserialization.\n'
               '    if (section->isBuilding()) {\n'
               '      LOG_INF("ERS", "Active build page load: lending framebuffer (ble=%u heap=%u maxAlloc=%u)",\n'
               '              BleHid.isRunning() ? 1 : 0, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());\n'
@@ -74,38 +70,34 @@ jobs:
           if s.count(needle) != 1:
               raise SystemExit(f'expected exactly one page-load target, found {s.count(needle)}')
           s = s.replace(needle, insert + needle, 1)
-
-          old = '''  const auto restoreFramebufferForDraw = [&buildLoan]() {
-    if (!buildLoan.restore()) {
-      ESP.restart();
-      return false;
-    }
-    return true;
-  };
-'''
-          new = '''  const auto restoreFramebufferForDraw = [&buildLoan]() {
-    if (!buildLoan.restore()) {
-      ESP.restart();
-      return false;
-    }
-    // The framebuffer may restore successfully yet leave too little general heap
-    // for FontCacheManager::recordText()/std::string allocations. That was the
-    // field crash after several BLE page turns (11 KB free / 4.6 KB max block).
-    // Shed BLE before rendering when either floor is violated; lifecycle code can
-    // restart it later once the heap recovers.
-    if (BleHid.isRunning() &&
-        (ESP.getFreeHeap() < RENDER_MIN_FREE_HEAP || ESP.getMaxAllocHeap() < BACKGROUND_BUILD_MIN_MAX_ALLOC)) {
-      LOG_INF("ERS", "Render heap low after framebuffer restore; freeing BLE (heap=%u maxAlloc=%u)",
-              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
-      bleinput::stop();
-    }
-    return true;
-  };
-'''
+          old = (
+              '  const auto restoreFramebufferForDraw = [&buildLoan]() {\n'
+              '    if (!buildLoan.restore()) {\n'
+              '      ESP.restart();\n'
+              '      return false;\n'
+              '    }\n'
+              '    return true;\n'
+              '  };\n'
+          )
+          new = (
+              '  const auto restoreFramebufferForDraw = [&buildLoan]() {\n'
+              '    if (!buildLoan.restore()) {\n'
+              '      ESP.restart();\n'
+              '      return false;\n'
+              '    }\n'
+              '    // A successful framebuffer restore can still leave the general heap too fragmented for rendering.\n'
+              '    if (BleHid.isRunning() &&\n'
+              '        (ESP.getFreeHeap() < RENDER_MIN_FREE_HEAP || ESP.getMaxAllocHeap() < BACKGROUND_BUILD_MIN_MAX_ALLOC)) {\n'
+              '      LOG_INF("ERS", "Render heap low after framebuffer restore; freeing BLE (heap=%u maxAlloc=%u)",\n'
+              '              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());\n'
+              '      bleinput::stop();\n'
+              '    }\n'
+              '    return true;\n'
+              '  };\n'
+          )
           if old not in s:
               raise SystemExit('restoreFramebufferForDraw patch target not found')
-          s = s.replace(old, new, 1)
-          p.write_text(s)
+          p.write_text(s.replace(old, new, 1))
           PY
 
       - name: Build release firmware
