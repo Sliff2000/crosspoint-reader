@@ -173,19 +173,17 @@ jobs:
           s = s.replace(old, new, 1)
           p.write_text(s)
 
-          # A BLE link transition does not change reader pixels. Redrawing the reader
-          # on reconnect was the visible flash every read-ahead cycle. Keep lifecycle
-          # logging/reconnect, but suppress the unnecessary reader repaint.
           p = Path('src/main.cpp')
           s = p.read_text()
-          old = '''    if (activityManager.isReaderActivity() && !activityManager.currentKeepsBluetoothAlive()) {
-      activityManager.requestUpdate();
-    }
-'''
-          count = s.count(old)
+          redraw = (
+              '    if (activityManager.isReaderActivity() && !activityManager.currentKeepsBluetoothAlive()) {\n'
+              '      activityManager.requestUpdate();\n'
+              '    }\n'
+          )
+          count = s.count(redraw)
           if count != 2:
               raise SystemExit(f'expected two BLE reader redraw hooks, found {count}')
-          s = s.replace(old, '', 2)
+          s = s.replace(redraw, '', 2)
           p.write_text(s)
           PY
 
