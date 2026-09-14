@@ -51,7 +51,7 @@ jobs:
           sed -i 's/CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=50/CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=20/' platformio.ini
           sed -i 's/CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=10/CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=6/' platformio.ini
 
-      - name: Patch active-build page-load OOM
+      - name: Patch active-build and render OOM paths
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -59,22 +59,53 @@ jobs:
 
           p = Path('src/activities/reader/EpubReaderActivity.cpp')
           s = p.read_text()
+
           needle = '    auto p = section->loadPage(section->currentPage);\n'
           insert = (
               '    // An active incremental build keeps parser/CSS state resident. Lend the\n'
               '    // framebuffer before page deserialization so BLE + build state cannot\n'
-              '    // exhaust the C3 heap inside TextBlock allocation. restore() already\n'
-              '    // sheds BLE if the framebuffer cannot be reclaimed afterwards.\n'
+              '    // exhaust the C3 heap inside TextBlock allocation.\n'
               '    if (section->isBuilding()) {\n'
               '      LOG_INF("ERS", "Active build page load: lending framebuffer (ble=%u heap=%u maxAlloc=%u)",\n'
               '              BleHid.isRunning() ? 1 : 0, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());\n'
               '      buildLoan.release();\n'
               '    }\n'
           )
-          count = s.count(needle)
-          if count != 1:
-              raise SystemExit(f'expected exactly one page-load target, found {count}')
-          p.write_text(s.replace(needle, insert + needle, 1))
+          if s.count(needle) != 1:
+              raise SystemExit(f'expected exactly one page-load target, found {s.count(needle)}')
+          s = s.replace(needle, insert + needle, 1)
+
+          old = '''  const auto restoreFramebufferForDraw = [&buildLoan]() {
+    if (!buildLoan.restore()) {
+      ESP.restart();
+      return false;
+    }
+    return true;
+  };
+'''
+          new = '''  const auto restoreFramebufferForDraw = [&buildLoan]() {
+    if (!buildLoan.restore()) {
+      ESP.restart();
+      return false;
+    }
+    // The framebuffer may restore successfully yet leave too little general heap
+    // for FontCacheManager::recordText()/std::string allocations. That was the
+    // field crash after several BLE page turns (11 KB free / 4.6 KB max block).
+    // Shed BLE before rendering when either floor is violated; lifecycle code can
+    // restart it later once the heap recovers.
+    if (BleHid.isRunning() &&
+        (ESP.getFreeHeap() < RENDER_MIN_FREE_HEAP || ESP.getMaxAllocHeap() < BACKGROUND_BUILD_MIN_MAX_ALLOC)) {
+      LOG_INF("ERS", "Render heap low after framebuffer restore; freeing BLE (heap=%u maxAlloc=%u)",
+              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+      bleinput::stop();
+    }
+    return true;
+  };
+'''
+          if old not in s:
+              raise SystemExit('restoreFramebufferForDraw patch target not found')
+          s = s.replace(old, new, 1)
+          p.write_text(s)
           PY
 
       - name: Build release firmware
@@ -87,9 +118,9 @@ jobs:
           set -euo pipefail
           ADDR2LINE="$(find ~/.platformio/packages -type f -name 'riscv32-esp-elf-addr2line' | head -1)"
           "$ADDR2LINE" -pfiaC -e .pio/build/gh_release/firmware.elf \
-            0x421eda47 0x421eda4a 0x421eda96 0x421ed08a 0x421edce4 0x421edd0e \
-            0x4209f73a 0x42095266 0x4204723a 0x42095524 0x4209b506 0x42051aca \
-            0x4209c0a4 0x420ede2e 0x420cd370 | tee symbolized-crash.txt
+            0x421eda9b 0x421eda9e 0x421edaea 0x421edc0c 0x421f0aa2 0x421edd56 \
+            0x420511dc 0x42054e0a 0x4209f1c4 0x42094a58 0x420ea558 0x4204702c \
+            0x42051af0 0x420e8a40 0x421386b0 0x420edfda 0x420dddca | tee symbolized-crash.txt
 
       - name: Upload X3 BLE firmware and symbols
         uses: actions/upload-artifact@v6
