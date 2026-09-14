@@ -59,30 +59,22 @@ jobs:
 
           p = Path('src/activities/reader/EpubReaderActivity.cpp')
           s = p.read_text()
-          old = '''  {
-            auto p = section->loadPage(section->currentPage);
-            if (!p) {
-          '''
-          new = '''  {
-            // While an incremental section build is still alive, its parser/CSS state
-            // keeps a large amount of heap resident. The old code could enter page
-            // deserialization with BLE + framebuffer + build state all resident and
-            // exhaust the C3 heap inside `new (std::nothrow) TextBlock()`. libstdc++
-            // still tries to construct std::bad_alloc there, which terminates when
-            // the heap is already exhausted. Lend the 48 KB framebuffer before any
-            // page load from an active build; restore() already sheds BLE if the
-            // framebuffer cannot be reclaimed afterwards.
-            if (section->isBuilding()) {
-              LOG_INF("ERS", "Active build page load: lending framebuffer (ble=%u heap=%u maxAlloc=%u)",
-                      BleHid.isRunning() ? 1 : 0, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
-              buildLoan.release();
-            }
-            auto p = section->loadPage(section->currentPage);
-            if (!p) {
-          '''
-          if old not in s:
-              raise SystemExit('page-load patch target not found')
-          p.write_text(s.replace(old, new, 1))
+          needle = '    auto p = section->loadPage(section->currentPage);\n'
+          insert = (
+              '    // An active incremental build keeps parser/CSS state resident. Lend the\n'
+              '    // framebuffer before page deserialization so BLE + build state cannot\n'
+              '    // exhaust the C3 heap inside TextBlock allocation. restore() already\n'
+              '    // sheds BLE if the framebuffer cannot be reclaimed afterwards.\n'
+              '    if (section->isBuilding()) {\n'
+              '      LOG_INF("ERS", "Active build page load: lending framebuffer (ble=%u heap=%u maxAlloc=%u)",\n'
+              '              BleHid.isRunning() ? 1 : 0, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());\n'
+              '      buildLoan.release();\n'
+              '    }\n'
+          )
+          count = s.count(needle)
+          if count != 1:
+              raise SystemExit(f'expected exactly one page-load target, found {count}')
+          p.write_text(s.replace(needle, insert + needle, 1))
           PY
 
       - name: Build release firmware
