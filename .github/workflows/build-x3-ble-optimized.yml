@@ -96,8 +96,6 @@ jobs:
               '      LOG_INF("ERS", "Render heap low; suspending section build before BLE shed (heap=%u maxAlloc=%u)",\n'
               '              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());\n'
               '      section->suspendBuild();\n'
-              '      LOG_INF("ERS", "Section build suspended heap=%u maxAlloc=%u",\n'
-              '              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());\n'
               '    }\n'
               '    if (heapLow() && BleHid.isRunning()) {\n'
               '      LOG_INF("ERS", "Render heap still low; freeing BLE (heap=%u maxAlloc=%u)",\n'
@@ -149,8 +147,12 @@ jobs:
               '      partialRebuildStartFailed = true;\n'
               '      LOG_ERR("ERS", "Failed to start deferred partial extension build");\n'
               '    } else {\n'
-              '      LOG_DBG("ERS", "Reader near partial watermark (%d/%d), extending read-ahead window", section->currentPage,\n'
-              '              section->pageCount);\n'
+              '      // Build a short disk-backed read-ahead window. The physical e-ink panel\n'
+              '      // retains the current page while RAM framebuffer storage is loaned.\n'
+              '      // After restoring RAM, explicitly re-render the same logical page into\n'
+              '      // the framebuffer WITHOUT requesting a panel update. This keeps RAM and\n'
+              '      // panel state synchronized, preventing the next normal page turn from\n'
+              '      // clearing the panel or producing a blank frame.\n'
               '      FrameBufferBuildLoan buildLoan(renderer);\n'
               '      buildLoan.release();\n'
               '      if (!section->buildSomeMore(16)) {\n'
@@ -159,11 +161,21 @@ jobs:
               '        requestUpdate();\n'
               '      } else if (section->isBuilding()) {\n'
               '        section->suspendBuild();\n'
-              '        LOG_INF("ERS", "Read-ahead window persisted; BLE may reconnect (heap=%u maxAlloc=%u)",\n'
-              '                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());\n'
               '      }\n'
               '      if (!buildLoan.restore()) {\n'
               '        ESP.restart();\n'
+              '      } else if (section) {\n'
+              '        // Repaint only the in-RAM framebuffer; do not touch the e-ink panel.\n'
+              '        // The normal page-turn event will perform the next physical refresh.\n'
+              '        auto current = section->loadPage(section->currentPage);\n'
+              '        if (current) {\n'
+              '          renderer.clearScreen();\n'
+              '          renderer.renderPage(*current);\n'
+              '          LOG_INF("ERS", "Read-ahead complete; current page restored in framebuffer");\n'
+              '        } else {\n'
+              '          LOG_ERR("ERS", "Could not restore current page framebuffer after read-ahead");\n'
+              '          requestUpdate();\n'
+              '        }\n'
               '      }\n'
               '    }\n'
               '  }\n'
@@ -173,6 +185,7 @@ jobs:
           s = s.replace(old, new, 1)
           p.write_text(s)
 
+          # BLE transitions themselves must not trigger a reader panel repaint.
           p = Path('src/main.cpp')
           s = p.read_text()
           redraw = (
