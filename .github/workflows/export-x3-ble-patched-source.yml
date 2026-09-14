@@ -1,0 +1,178 @@
+name: Export tested X3 BLE source patch
+
+on:
+  push:
+    branches: [develop]
+    paths:
+      - '.github/workflows/export-x3-ble-patched-source.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout BLE feature source
+        uses: actions/checkout@v6
+        with:
+          repository: crosspoint-reader/crosspoint-reader
+          ref: 869b01e909c622989988db595b7ac8672cbfb100
+          submodules: recursive
+
+      - name: Apply tested X3 BLE stability patch
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          # Reader constants: smaller read-ahead and stronger heap/fragmentation gates.
+          h = Path('src/activities/reader/EpubReaderActivity.h')
+          hs = h.read_text()
+          replacements = {
+              '  static constexpr int BUILD_PAGES_PER_CHUNK = 8;': '  static constexpr int BUILD_PAGES_PER_CHUNK = 4;',
+              '  static constexpr int BACKGROUND_BUILD_PAGES_PER_TICK = 2;': '  static constexpr int BACKGROUND_BUILD_PAGES_PER_TICK = 1;',
+              '  static constexpr size_t BACKGROUND_BUILD_MIN_FREE_HEAP = 26 * 1024;': '  static constexpr size_t BACKGROUND_BUILD_MIN_FREE_HEAP = 34 * 1024;',
+              '  static constexpr size_t BACKGROUND_BUILD_MIN_MAX_ALLOC = 13 * 1024;': '  static constexpr size_t BACKGROUND_BUILD_MIN_MAX_ALLOC = 20 * 1024;',
+              '  static constexpr size_t RENDER_MIN_FREE_HEAP = 24 * 1024;': '  static constexpr size_t RENDER_MIN_FREE_HEAP = 30 * 1024;',
+              '  static constexpr int BUILD_WINDOW_AHEAD = 5;': '  static constexpr int BUILD_WINDOW_AHEAD = 4;',
+          }
+          for old, new in replacements.items():
+              if old not in hs:
+                  raise SystemExit(f'header patch target missing: {old}')
+              hs = hs.replace(old, new, 1)
+          h.write_text(hs)
+
+          p = Path('src/activities/reader/EpubReaderActivity.cpp')
+          s = p.read_text()
+
+          # Before page deserialization, suspend background parsing and loan the
+          # framebuffer only when heap or largest contiguous block is tight.
+          needle = '    auto p = section->loadPage(section->currentPage);\n'
+          insert = (
+              '    if (section->isBuilding()) {\n'
+              '      section->suspendBuild();\n'
+              '    }\n'
+              '    if (ESP.getFreeHeap() < RENDER_MIN_FREE_HEAP ||\n'
+              '        ESP.getMaxAllocHeap() < BACKGROUND_BUILD_MIN_MAX_ALLOC) {\n'
+              '      buildLoan.release();\n'
+              '    }\n'
+          )
+          if s.count(needle) != 1:
+              raise SystemExit(f'page load target mismatch: {s.count(needle)}')
+          s = s.replace(needle, insert + needle, 1)
+
+          # Low heap pauses background parsing; BLE is only shed by the existing
+          # framebuffer restore path if an actual framebuffer allocation fails.
+          old = (
+              '  const auto restoreFramebufferForDraw = [&buildLoan]() {\n'
+              '    if (!buildLoan.restore()) {\n'
+              '      ESP.restart();\n'
+              '      return false;\n'
+              '    }\n'
+              '    return true;\n'
+              '  };\n'
+          )
+          new = (
+              '  const auto restoreFramebufferForDraw = [this, &buildLoan]() {\n'
+              '    if (!buildLoan.restore()) {\n'
+              '      ESP.restart();\n'
+              '      return false;\n'
+              '    }\n'
+              '    if ((ESP.getFreeHeap() < RENDER_MIN_FREE_HEAP ||\n'
+              '         ESP.getMaxAllocHeap() < BACKGROUND_BUILD_MIN_MAX_ALLOC) &&\n'
+              '        section && section->isBuilding()) {\n'
+              '      section->suspendBuild();\n'
+              '    }\n'
+              '    return true;\n'
+              '  };\n'
+          )
+          if old not in s:
+              raise SystemExit('restore target mismatch')
+          s = s.replace(old, new, 1)
+
+          old = (
+              '  if (section && !section->isBuilding() && section->isPartial() && !RenderLock::peek() && buildViewportWidth > 0 &&\n'
+              '      !partialRebuildStartFailed &&\n'
+              '      section->currentPage + PARTIAL_REBUILD_START_MARGIN >= static_cast<int>(section->pageCount)) {\n'
+          )
+          new = (
+              '  const int partialResumeMargin = BleHid.isRunning() ? 4 : PARTIAL_REBUILD_START_MARGIN;\n'
+              '  if (section && !section->isBuilding() && section->isPartial() && !RenderLock::peek() && buildViewportWidth > 0 &&\n'
+              '      !partialRebuildStartFailed &&\n'
+              '      section->currentPage + partialResumeMargin >= static_cast<int>(section->pageCount)) {\n'
+          )
+          if old not in s:
+              raise SystemExit('partial condition mismatch')
+          s = s.replace(old, new, 1)
+
+          old = (
+              '  if (BleHid.isRunning()) {\n'
+              '    LOG_INF("ERS", "Background build needs heap (free=%u maxAlloc=%u); freeing BLE RAM", (unsigned)freeHeap,\n'
+              '            (unsigned)maxBlock);\n'
+              '    bleinput::stop();\n'
+              '  }\n'
+              '  buildHeapPaused = true;\n'
+              '  return false;\n'
+          )
+          new = (
+              '  if (BleHid.isRunning()) {\n'
+              '    LOG_INF("ERS", "Background build paused for heap (free=%u maxAlloc=%u); keeping BLE connected",\n'
+              '            (unsigned)freeHeap, (unsigned)maxBlock);\n'
+              '  }\n'
+              '  buildHeapPaused = true;\n'
+              '  return false;\n'
+          )
+          if old not in s:
+              raise SystemExit('background heap gate target mismatch')
+          s = s.replace(old, new, 1)
+
+          # Do not draw the indexing popup while BLE is active at the partial
+          # cache boundary; silently extend with the framebuffer loaned instead.
+          old = (
+              '  if (section->isPartial() && section->currentPage >= static_cast<int>(section->pageCount)) {\n'
+              '    GUI.drawPopup(renderer, tr(STR_INDEXING));\n'
+              '    pagesUntilFullRefresh = 1;\n'
+              '  }\n'
+          )
+          new = (
+              '  if (section->isPartial() && section->currentPage >= static_cast<int>(section->pageCount) &&\n'
+              '      !BleHid.isRunning() && renderer.hasFrameBuffer()) {\n'
+              '    GUI.drawPopup(renderer, tr(STR_INDEXING));\n'
+              '    pagesUntilFullRefresh = 1;\n'
+              '  }\n'
+          )
+          if old not in s:
+              raise SystemExit('indexing popup target mismatch')
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          # X3 BLE memory tuning used by the tested firmware.
+          ini = Path('platformio.ini')
+          ps = ini.read_text()
+          for old, new in {
+              'CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=6': 'CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=4',
+              'CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=6': 'CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=4',
+              'CONFIG_BT_NIMBLE_ACL_BUF_COUNT=6': 'CONFIG_BT_NIMBLE_ACL_BUF_COUNT=4',
+              'CONFIG_BT_NIMBLE_HCI_EVT_HI_BUF_COUNT=12': 'CONFIG_BT_NIMBLE_HCI_EVT_HI_BUF_COUNT=8',
+              'CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=6': 'CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=4',
+              'CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=12': 'CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=8',
+              'CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=50': 'CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=20',
+              'CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=10': 'CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=6',
+          }.items():
+              if old not in ps:
+                  raise SystemExit(f'platformio patch target missing: {old}')
+              ps = ps.replace(old, new, 1)
+          ini.write_text(ps)
+          PY
+
+      - name: Upload patched source
+        uses: actions/upload-artifact@v6
+        with:
+          name: x3-ble-source-patch
+          path: |
+            src/activities/reader/EpubReaderActivity.cpp
+            src/activities/reader/EpubReaderActivity.h
+            platformio.ini
+          if-no-files-found: error
