@@ -332,8 +332,8 @@ bool EpubReaderActivity::buildTickHeapGate() {
   // just wait: page-turn transients free up between turns and the tick retries
   // every loop pass.
   if (BleHid.isRunning()) {
-    LOG_INF("ERS", "Background build paused for heap (free=%u maxAlloc=%u); keeping BLE connected",
-            (unsigned)freeHeap, (unsigned)maxBlock);
+    LOG_INF("ERS", "Background build paused for heap (free=%u maxAlloc=%u); keeping BLE connected", (unsigned)freeHeap,
+            (unsigned)maxBlock);
   }
   buildHeapPaused = true;
   return false;
@@ -1362,8 +1362,8 @@ void EpubReaderActivity::renderBook() {
     }
   }
 
-  if (section->isPartial() && section->currentPage >= static_cast<int>(section->pageCount) &&
-      !BleHid.isRunning() && renderer.hasFrameBuffer()) {
+  if (section->isPartial() && section->currentPage >= static_cast<int>(section->pageCount) && !BleHid.isRunning() &&
+      renderer.hasFrameBuffer()) {
     GUI.drawPopup(renderer, tr(STR_INDEXING));
     pagesUntilFullRefresh = 1;
   }
@@ -1408,8 +1408,7 @@ void EpubReaderActivity::renderBook() {
       ESP.restart();
       return false;
     }
-    if ((ESP.getFreeHeap() < RENDER_MIN_FREE_HEAP ||
-         ESP.getMaxAllocHeap() < BACKGROUND_BUILD_MIN_MAX_ALLOC) &&
+    if ((ESP.getFreeHeap() < RENDER_MIN_FREE_HEAP || ESP.getMaxAllocHeap() < BACKGROUND_BUILD_MIN_MAX_ALLOC) &&
         section && section->isBuilding()) {
       section->suspendBuild();
     }
@@ -1446,8 +1445,7 @@ void EpubReaderActivity::renderBook() {
     if (section->isBuilding()) {
       section->suspendBuild();
     }
-    if (ESP.getFreeHeap() < RENDER_MIN_FREE_HEAP ||
-        ESP.getMaxAllocHeap() < BACKGROUND_BUILD_MIN_MAX_ALLOC) {
+    if (ESP.getFreeHeap() < RENDER_MIN_FREE_HEAP || ESP.getMaxAllocHeap() < BACKGROUND_BUILD_MIN_MAX_ALLOC) {
       buildLoan.release();
     }
     auto p = section->loadPage(section->currentPage);
